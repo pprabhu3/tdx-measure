@@ -212,26 +212,36 @@ fn extract_kernel_version_from_cmdline(cmdline: &str) -> Result<String> {
 
 /// Main function to measure RTMR1 from a qcow2 disk image
 pub fn measure_rtmr1_from_qcow2(qcow2_path: &str) -> Result<Vec<u8>> {
-    // Extract bootloader files
+    measure_rtmr1_from_qcow2_with_efi_paths(
+        qcow2_path,
+        &[
+            "/boot/efi/EFI/ubuntu/shimx64.efi",
+            "/boot/efi/EFI/ubuntu/grubx64.efi",
+        ],
+    )
+}
+
+/// Measure RTMR1 for EFI applications in the order they were launched.
+pub fn measure_rtmr1_from_qcow2_with_efi_paths(qcow2_path: &str, efi_paths: &[&str]) -> Result<Vec<u8>> {
+    if efi_paths.is_empty() {
+        bail!("at least one EFI application path is required");
+    }
+
     let gpt_data = extract_gpt_event_data(qcow2_path)?;
-    let shim_data = guestfish_download(qcow2_path, "/boot/efi/EFI/ubuntu/shimx64.efi")?;
-    let grub_data = guestfish_download(qcow2_path, "/boot/efi/EFI/ubuntu/grubx64.efi")?;
-
-    // Compute hashes of the bootloader components
-    let gpt_hash = measure_sha384(&gpt_data);
-    let shim_hash = authenticode_sha384_hash(&shim_data).context("Failed to compute shim hash")?;
-    let grub_hash = authenticode_sha384_hash(&grub_data).context("Failed to compute grub hash")?;
-
-    // Compute RTMR1 log
-    let rtmr1_log = vec![
+    let mut rtmr1_log = vec![
         measure_sha384(b"Calling EFI Application from Boot Option"),
         measure_sha384(&[0x00, 0x00, 0x00, 0x00]), // Separator
-        gpt_hash,
-        shim_hash,
-        grub_hash,
-        measure_sha384(b"Exit Boot Services Invocation"),
-        measure_sha384(b"Exit Boot Services Returned with Success"),
+        measure_sha384(&gpt_data),
     ];
+    for path in efi_paths {
+        let program = guestfish_download(qcow2_path, path)?;
+        rtmr1_log.push(
+            authenticode_sha384_hash(&program)
+                .with_context(|| format!("Failed to compute EFI hash for {path}"))?,
+        );
+    }
+    rtmr1_log.push(measure_sha384(b"Exit Boot Services Invocation"));
+    rtmr1_log.push(measure_sha384(b"Exit Boot Services Returned with Success"));
 
     debug_print_log("RTMR1", &rtmr1_log);
     Ok(measure_log(&rtmr1_log))
