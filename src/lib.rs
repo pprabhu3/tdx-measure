@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_human_bytes as hex_bytes;
 
 pub use image::measure_rtmr2_from_qcow2_mok_events;
+pub use image::measure_rtmrs_from_qcow2_with_boot_chain;
 pub use machine::Machine;
 
 use util::{measure_log, measure_sha384};
@@ -87,6 +88,19 @@ pub struct DirectBoot {
     pub kernel: String,
     pub initrd: String,
     pub cmdline: String,
+}
+
+/// Caller-selected boot route; the disk image cannot reveal the firmware's choice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BootChain {
+    Named(String),
+    Paths(Vec<String>),
+}
+
+impl BootChain {
+    pub const VENDOR: &'static str = "vendor";
+    pub const REMOVABLE_MEDIA: &'static str = "removable-media";
 }
 
 /// Indirect boot specific information

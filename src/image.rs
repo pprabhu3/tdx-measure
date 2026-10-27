@@ -8,12 +8,96 @@ use crate::util::utf16_encode;
 use crate::{
     measure_log, measure_sha384,
     util::{authenticode_sha384_hash, debug_print_log},
+    BootChain,
 };
 use anyhow::{bail, Context, Result};
 use log::debug;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+
+const ESP: &str = "/boot/efi/EFI";
+
+fn resolve_boot_chain(qcow2_path: &str, chain: &BootChain) -> Result<Vec<String>> {
+    match chain {
+        BootChain::Paths(paths) => {
+            if paths.is_empty() || paths.iter().any(|path| !path.starts_with('/')) {
+                bail!("boot chain paths must be a nonempty list of absolute guest paths");
+            }
+            Ok(paths.clone())
+        }
+        BootChain::Named(name) => {
+            if name != BootChain::VENDOR && name != BootChain::REMOVABLE_MEDIA {
+                bail!("unknown boot chain {name:?}; expected vendor or removable-media");
+            }
+            let output = Command::new("guestfish")
+                .args(["--ro", "-a", qcow2_path, "-i", "find", ESP])
+                .output()
+                .context("Failed to list the guest EFI system partition")?;
+            if !output.status.success() {
+                bail!(
+                    "Failed to list the guest EFI system partition: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let entries = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| line.trim().trim_start_matches('/').to_string())
+                .collect::<Vec<_>>();
+            resolve_named_boot_chain(&entries, name)
+        }
+    }
+}
+
+fn resolve_named_boot_chain(entries: &[String], name: &str) -> Result<Vec<String>> {
+    let mut vendors = entries
+        .iter()
+        .filter_map(|entry| {
+            let (vendor, file) = entry.split_once('/')?;
+            if !vendor.eq_ignore_ascii_case("BOOT") && file.eq_ignore_ascii_case("shimx64.efi") {
+                Some(vendor)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    vendors.sort_unstable();
+    vendors.dedup();
+    let [vendor] = vendors[..] else {
+        bail!(
+            "expected one vendor shim on {ESP}, found {}; supply explicit paths instead",
+            vendors.len()
+        );
+    };
+    let vendor_grub = format!("{vendor}/grubx64.efi");
+    if !entries
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(&vendor_grub))
+    {
+        bail!("{ESP}/{vendor} contains shim but no grubx64.efi");
+    }
+    let vendor_chain = [
+        format!("{ESP}/{vendor}/shimx64.efi"),
+        format!("{ESP}/{vendor}/grubx64.efi"),
+    ];
+    match name {
+        BootChain::VENDOR => Ok(vendor_chain.to_vec()),
+        BootChain::REMOVABLE_MEDIA => {
+            let fallback = ["BOOT/BOOTX64.EFI", "BOOT/fbx64.efi"];
+            for path in fallback {
+                if !entries.iter().any(|entry| entry.eq_ignore_ascii_case(path)) {
+                    bail!("{ESP}/{path} is missing from the selected boot chain");
+                }
+            }
+            Ok(fallback
+                .iter()
+                .map(|path| format!("{ESP}/{path}"))
+                .chain(vendor_chain)
+                .collect())
+        }
+        _ => bail!("unknown boot chain {name:?}"),
+    }
+}
 
 /// Helper function to download a file using guestfish
 fn guestfish_download(qcow2_path: &str, source_path: &str) -> Result<Vec<u8>> {
@@ -56,6 +140,37 @@ fn guestfish_download(qcow2_path: &str, source_path: &str) -> Result<Vec<u8>> {
     let _ = std::fs::remove_dir_all(&temp_dir);
 
     Ok(data)
+}
+
+fn download_boot_chain(qcow2_path: &str, paths: &[String]) -> Result<Vec<Vec<u8>>> {
+    let temp_dir = tempfile::tempdir().context("Failed to create a temporary directory")?;
+    let destinations = (0..paths.len())
+        .map(|i| temp_dir.path().join(i.to_string()).display().to_string())
+        .collect::<Vec<_>>();
+    let mut args = vec!["--ro", "-a", qcow2_path, "-i"];
+    for (index, (source, destination)) in paths.iter().zip(&destinations).enumerate() {
+        if index > 0 {
+            args.push(":");
+        }
+        args.extend(["download", source, destination]);
+    }
+    let output = Command::new("guestfish")
+        .args(args)
+        .output()
+        .context("Failed to read the EFI boot chain")?;
+    if !output.status.success() {
+        bail!(
+            "Failed to read the EFI boot chain: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    paths
+        .iter()
+        .zip(&destinations)
+        .map(|(source, destination)| {
+            fs::read(destination).with_context(|| format!("Failed to read {source} from the guest"))
+        })
+        .collect()
 }
 
 /// Extracts GPT event data in the format used by EV_EFI_GPT_EVENT
@@ -231,17 +346,23 @@ pub fn measure_rtmr1_from_qcow2_with_efi_paths(
         bail!("at least one EFI application path is required");
     }
 
+    let programs = efi_paths
+        .iter()
+        .map(|path| guestfish_download(qcow2_path, path))
+        .collect::<Result<Vec<_>>>()?;
+    measure_rtmr1_from_programs(qcow2_path, &programs)
+}
+
+fn measure_rtmr1_from_programs(qcow2_path: &str, programs: &[Vec<u8>]) -> Result<Vec<u8>> {
     let gpt_data = extract_gpt_event_data(qcow2_path)?;
     let mut rtmr1_log = vec![
         measure_sha384(b"Calling EFI Application from Boot Option"),
         measure_sha384(&[0x00, 0x00, 0x00, 0x00]), // Separator
         measure_sha384(&gpt_data),
     ];
-    for path in efi_paths {
-        let program = guestfish_download(qcow2_path, path)?;
+    for program in programs {
         rtmr1_log.push(
-            authenticode_sha384_hash(&program)
-                .with_context(|| format!("Failed to compute EFI hash for {path}"))?,
+            authenticode_sha384_hash(&program).context("Failed to compute EFI application hash")?,
         );
     }
     rtmr1_log.push(measure_sha384(b"Exit Boot Services Invocation"));
@@ -304,4 +425,30 @@ pub fn measure_rtmr2_from_qcow2_mok_events(
     }
     debug_print_log("RTMR2", &rtmr2_log);
     Ok(measure_log(&rtmr2_log))
+}
+
+/// Predict RTMR1 and shim-only RTMR2 for the chosen boot route.
+/// Assumes fresh MOK state and excludes GRUB events.
+pub fn measure_rtmrs_from_qcow2_with_boot_chain(
+    qcow2_path: &str,
+    boot_chain: &BootChain,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let paths = resolve_boot_chain(qcow2_path, boot_chain)?;
+    let programs = download_boot_chain(qcow2_path, &paths)?;
+    let rtmr1 = measure_rtmr1_from_programs(qcow2_path, &programs)?;
+
+    let mut rtmr2_log = Vec::new();
+    for (path, program) in paths.iter().zip(&programs) {
+        if shim::vendor_mok_data(program)?.is_some() {
+            rtmr2_log.extend(
+                shim::mok_digests(program)
+                    .with_context(|| format!("Failed to derive MOK measurements from {path}"))?,
+            );
+        }
+    }
+    if rtmr2_log.is_empty() {
+        bail!("no shim found in the selected boot chain");
+    }
+    debug_print_log("RTMR2", &rtmr2_log);
+    Ok((rtmr1, measure_log(&rtmr2_log)))
 }
