@@ -8,6 +8,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_human_bytes as hex_bytes;
 
+pub use image::measure_rtmr2_from_qcow2_mok_events;
 pub use machine::Machine;
 
 use util::{measure_log, measure_sha384};
@@ -17,6 +18,7 @@ mod image;
 mod kernel;
 mod machine;
 mod num;
+mod shim;
 mod tdvf;
 mod util;
 

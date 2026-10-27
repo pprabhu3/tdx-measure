@@ -3,6 +3,7 @@
  * Copyright (c) 2025 Tinfoil Inc
  * SPDX-License-Identifier: Apache-2.0
  */
+use crate::shim;
 use crate::util::utf16_encode;
 use crate::{
     measure_log, measure_sha384,
@@ -222,7 +223,10 @@ pub fn measure_rtmr1_from_qcow2(qcow2_path: &str) -> Result<Vec<u8>> {
 }
 
 /// Measure RTMR1 for EFI applications in the order they were launched.
-pub fn measure_rtmr1_from_qcow2_with_efi_paths(qcow2_path: &str, efi_paths: &[&str]) -> Result<Vec<u8>> {
+pub fn measure_rtmr1_from_qcow2_with_efi_paths(
+    qcow2_path: &str,
+    efi_paths: &[&str],
+) -> Result<Vec<u8>> {
     if efi_paths.is_empty() {
         bail!("at least one EFI application path is required");
     }
@@ -276,6 +280,28 @@ pub fn measure_rtmr2_from_qcow2(
         measure_sha384(&initrd_data),
     ];
 
+    debug_print_log("RTMR2", &rtmr2_log);
+    Ok(measure_log(&rtmr2_log))
+}
+
+/// Compute RTMR2 from fresh-state MOK events for the given shim paths.
+/// Paths must follow boot order; other RTMR2 events are excluded.
+pub fn measure_rtmr2_from_qcow2_mok_events(
+    qcow2_path: &str,
+    shim_paths: &[&str],
+) -> Result<Vec<u8>> {
+    if shim_paths.is_empty() {
+        bail!("at least one shim path is required");
+    }
+
+    let mut rtmr2_log = Vec::new();
+    for path in shim_paths {
+        let shim_binary = guestfish_download(qcow2_path, path)?;
+        rtmr2_log.extend(
+            shim::mok_digests(&shim_binary)
+                .with_context(|| format!("Failed to derive MOK measurements from {path}"))?,
+        );
+    }
     debug_print_log("RTMR2", &rtmr2_log);
     Ok(measure_log(&rtmr2_log))
 }
