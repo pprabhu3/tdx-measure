@@ -125,6 +125,21 @@ main archive:
 
 ### Indirect Boot
 
+To measure a disk image, provide the image and the EFI boot route:
+
+```json
+{
+  "indirect": {
+    "qcow2": "guest.qcow2",
+    "boot_chain": "removable-media"
+  }
+}
+```
+
+Run `tdx-measure metadata.json --runtime-only --json` to get RTMR1 and RTMR2.
+Use `"vendor"` if firmware starts the vendor shim directly. 
+Use `"removable-media"` if it starts `BOOTX64.EFI`, then `fbx64.efi`, the vendor shim, and GRUB. 
+
 #### Metadata
 
 Create `metadata.json` file with the below metadata:

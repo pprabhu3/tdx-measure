@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use fs_err as fs;
 use std::path::{Path, PathBuf};
-use tdx_measure::{ImageConfig, Machine};
+use tdx_measure::{BootChain, ImageConfig, Machine, TdxMeasurements};
 
 mod transcript;
 use transcript::generate_transcript;
@@ -347,11 +347,61 @@ fn output_measurements(config: &Cli, measurements: &tdx_measure::TdxMeasurements
     Ok(())
 }
 
+/// Run the opt-in disk-boot profile without changing the legacy metadata API.
+fn measure_selected_disk_boot(config: &Cli, metadata: &serde_json::Value) -> Result<()> {
+    if !config.runtime_only || config.platform_only {
+        return Err(anyhow!("indirect.boot_chain requires --runtime-only"));
+    }
+
+    let indirect = metadata["indirect"]
+        .as_object()
+        .context("indirect metadata must be a JSON object")?;
+
+    let image = indirect
+        .get("qcow2")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+        .context("indirect.qcow2 must be a nonempty guest image path")?;
+    let boot_chain: BootChain = serde_json::from_value(
+        indirect
+            .get("boot_chain")
+            .context("indirect.boot_chain is required")?
+            .clone(),
+    )
+    .context("indirect.boot_chain must be a route name or an ordered path list")?;
+    let image_path = config
+        .metadata
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(image);
+    let image_path = image_path.to_string_lossy();
+    let (rtmr1, rtmr2) =
+        tdx_measure::measure_rtmrs_from_qcow2_with_boot_chain(&image_path, &boot_chain)?;
+    output_measurements(
+        config,
+        &TdxMeasurements {
+            mrtd: Vec::new(),
+            rtmr0: Vec::new(),
+            rtmr1,
+            rtmr2,
+        },
+    )
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
     let metadata = fs::read_to_string(&cli.metadata).context("Failed to read image metadata")?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&metadata).context("Failed to parse image metadata")?;
+    if raw
+        .get("indirect")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|indirect| indirect.contains_key("boot_chain"))
+    {
+        return measure_selected_disk_boot(&cli, &raw);
+    }
     let image_config: ImageConfig =
         serde_json::from_str(&metadata).context("Failed to parse image metadata")?;
 
